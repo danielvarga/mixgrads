@@ -96,8 +96,7 @@ def train(args, model, device, train_loader, optimizer, epoch):
     print(len(full_grad_save), "gradients collected")
     # grad_tables = merge_grads(full_grad_save)
     full_record = (initial_state_dict, final_state_dict, full_grad_save)
-    with open("record.pkl", "wb") as f:
-        pickle.dump(full_record, f)
+    return full_record
 
 
 # almost the same as test(), should refactor
@@ -124,6 +123,7 @@ def evaluate(model, device, test_loader, n=1e9):
 
 def apply_gradients(model, moment_state, gradients, lr, moment):
     device = "cuda"
+    # print("moment", moment, "lr", lr) ; exit()
     for param_tensor, moment_tensor, gradient_tensor in zip(model.parameters(), moment_state, gradients):
         moment_tensor *= moment
         moment_tensor -= lr * gradient_tensor.to(device)
@@ -144,6 +144,8 @@ def replay(model, test_loader, initial_state_dict, final_state_dict, full_grad_s
             if batch_idx % log_interval == 0:
                 test_loss, test_acc = evaluate(model, device, test_loader)
                 print(f"batch_idx: {batch_idx}\tloss: {test_loss:.6f}\tacc: {test_acc:.6f}")
+    test_loss, test_acc = evaluate(model, device, test_loader)
+    print(f"final\tloss: {test_loss:.6f}\tacc: {test_acc:.6f}")
 
 
 def test(model, device, test_loader):
@@ -177,6 +179,10 @@ def create_loaders(train_kwargs, test_kwargs):
     train_loader = torch.utils.data.DataLoader(dataset1, **train_kwargs)
     test_loader = torch.utils.data.DataLoader(dataset2, **test_kwargs)
     return train_loader, test_loader
+
+
+def pickle_filename(bs, lr, moment):
+    return f"record.bs{bs}_lr{lr}_mom{moment}.pkl"
 
 
 def main():
@@ -224,38 +230,61 @@ def main():
 
     train_loader, test_loader = create_loaders(train_kwargs, test_kwargs)
 
+    lr = 0.01
+    moment = 0.9
+
     model = Net().to(device)
     # optimizer = optim.Adadelta(model.parameters(), lr=1.0)
-    optimizer = optim.SGD(model.parameters(), lr=0.01, moment=0.9)
+    optimizer = optim.SGD(model.parameters(), lr=lr, momentum=moment)
 
     # scheduler = StepLR(optimizer, step_size=1, gamma=0.7)
     for epoch in range(1, args.epochs + 1):
-        train(args, model, device, train_loader, optimizer, epoch)
+        full_record = train(args, model, device, train_loader, optimizer, epoch)
         test(model, device, test_loader)
         # scheduler.step()
 
     if args.save_model:
         torch.save(model.state_dict(), "mnist_cnn.pt")
 
+    filename = pickle_filename(args.batch_size, lr, moment)
+    print("saving gradient records to", filename)
+    with open(filename, "wb") as f:
+        pickle.dump(full_record, f)
+
 
 def main_replay():
+    batch_size = 64 # should be in sync with the way the pickle was built
+    # lr = 0.08 ; moment = 0.0
+    # lr = 0.04 ; moment = 0.1
+    # lr = 0.02 ; moment = 0.5
+    lr = 0.01 ; moment = 0.9
+    do_shuffling = True
+
+    filename = pickle_filename(batch_size, lr, moment)
+
     # probably not worth loading to gpu, but cpu does not have float16.
     device = "cuda"
     model = Net().to(device)
-    with open("record.pkl", "rb") as f:
+    with open(filename, "rb") as f:
         full_record = pickle.load(f)
     (initial_state_dict, final_state_dict, full_grad_save) = full_record
-    print("full gradient replay read from pickle")
+    print("full gradient record read from pickle", filename)
 
-    random.shuffle(full_grad_save)
+    '''
+    first_grads = full_grad_save[0]
+    for param in first_grads:
+        print(torch.numel(param))
+    exit()
+    '''
 
-    batch_size = 64 # should be in sync with the way the pickle was built
-    lr = 0.01
-    moment = 0.9
+    if do_shuffling:
+        print("randomly shuffling gradients across minibatches before replay")
+        random.shuffle(full_grad_save)
 
     train_kwargs = test_kwargs = {'batch_size': batch_size}
     train_loader, test_loader = create_loaders(train_kwargs, test_kwargs)
 
+    print("replaying")
     replay(model, test_loader, initial_state_dict, final_state_dict, full_grad_save, lr, moment)
 
 
