@@ -59,19 +59,117 @@ class LeNet(nn.Module):
         '''
         x = F.max_pool2d(F.relu(self.conv1(x)), (2, 2))
         x = F.max_pool2d(F.relu(self.conv2(x)), (2, 2))
-        x = x.view(-1, self.num_flat_features(x))
+        x = torch.flatten(x, 1)
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         x = self.fc3(x)
         x = F.log_softmax(x, dim=1)
         return x
 
-    def num_flat_features(self, x):
+
+class MLP(nn.Module):
+    def __init__(self):
+        super(MLP, self).__init__()
+        self.fc1   = nn.Linear(28 * 28, 100)
+        self.fc2   = nn.Linear(100, 10)
+
+    def forward(self, x):
+        x = torch.flatten(x, 1)
+        x = self.fc1(x)
+        x = F.relu(x)
+        x = self.fc2(x)
+        x = F.log_softmax(x, dim=1)
+        return x
+
+
+class MetaHomogeneousLinear(nn.Module):
+    def __init__(self, initial_state, gradients, coeffs):
+        super(MetaHomogeneousLinear, self).__init__()
+        self.initial_state = initial_state
+        self.gradients = gradients
+        self.coeffs = coeffs
+
+    def forward(self, x):
+        weights = self.initial_state + self.coeffs @ self.gradients
+        return F.linear(x, weights, 0)
+
+
+class MetaBias(nn.Module):
+    def __init__(self, initial_state, gradients, coeffs):
+        super(MetaBias, self).__init__()
+        self.initial_state = initial_state
+        self.gradients = gradients
+        self.coeffs = coeffs
+
+    def forward(self, x):
+        weights = self.initial_state + self.coeffs @ self.gradients
+        return x + weights
+
+
+class MetaLinear(nn.Module):
+    def __init__(self, W_initial_state, W_gradients, b_initial_state, b_gradients, coeffs):
+        super(MetaLinear, self).__init__()
+        self.metaHomogeneousLinear = MetaHomogeneousLinear(W_initial_state, W_gradients, coeffs)
+        self.metaBias = MetaBias(b_initial_state, b_gradients, coeffs)
+
+    def forward(self, x):
+        x = self.metaHomogeneousLinear(x)
+        x = self.metaBias(x)
+        return x
+
+
+class MetaMLP():
+    def __init__(self, initial_state_dict, grad_tables):
+        super(MetaLeNet, self).__init__()
+        n = grad_tables[0].shape[0]
+        print(f"constructing meta network from {n} gradient steps")
+        self.meta_layer = torch.ones(n, requires_grad=True)
+        self.fc1   = MetaLinear(initial_state[0], grad_tables[0], initial_state[1], grad_tables[1], self.meta_layer)
+        self.fc2   = MetaLinear(initial_state[2], grad_tables[2], initial_state[3], grad_tables[3], self.meta_layer)
+
+    def forward(self, x):
+        x = torch.flatten(x)
+        x = self.fc1(x)
+        x = F.relu(x)
+        x = self.fc2(x)
+        x = F.log_softmax(x, dim=1)
+        return x
+
+
+# gets a random init and a bunch of gradients. finds the optimal
+# weights for the gradients.
+# it's not reasonable to do the meta-ing in a general way, decorators or such,
+# for now we just reimplement LeNet with the extra stuff needed.
+class MetaLeNet(nn.Module):
+    # network structure
+    def __init__(self, initial_state_dict, grad_tables):
+        super(MetaLeNet, self).__init__()
+        n = grad_tables[0].shape[0]
+        print(f"constructing meta network from {n} gradient steps")
+        self.meta_layer = torch.ones(n, requires_grad=True)
+
+        self.conv1 = MetaConv2d(1, 6, 5, padding=2)
+        self.conv2 = MetaConv2d(6, 16, 5)
+        self.fc1   = MetaLinear(16*5*5, 120)
+        self.fc2   = MetaLinear(120, 84)
+        self.fc3   = MetaLinear(84, 10)
+
+    def forward(self, x):
         '''
-        Get the number of features in a batch of tensors `x`.
+        One forward pass through the network.
+
+        Args:
+            x: input
         '''
-        size = x.size()[1:]
-        return np.prod(size)
+        x = F.max_pool2d(F.relu(self.conv1(x)), (2, 2))
+        x = F.max_pool2d(F.relu(self.conv2(x)), (2, 2))
+        x = torch.flatten(x, 1)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
+        x = F.log_softmax(x, dim=1)
+        return x
+
 
 def save_params(model):
     params = []
@@ -218,7 +316,6 @@ def pickle_filename(nick, bs, lr, moment):
 
 
 
-
 # this is where we set up everything:
 
 batch_size = 64 # should be in sync with the way the pickle was built
@@ -229,13 +326,26 @@ lr = 0.08 ; moment = 0.0
 # lr = 0.01 ; moment = 0.9
 
 # nick = "record"
-nick = "lenet"
+# nick = "lenet"
+nick = "mlp"
 
 # task = "train"
 task = "replay"
-do_shuffling = True
+do_shuffling = False
 
 device = "cuda"
+
+
+def model_factory(nick):
+    if nick == "lenet":
+        model = LeNet()
+    elif nick == "mlp":
+        model = MLP()
+    elif nick == "record":
+        model = Net()
+    else:
+        assert False, f"unknown network topology {nick}"
+    return model
 
 
 def main_train():
@@ -253,7 +363,9 @@ def main_train():
 
     train_loader, test_loader = create_loaders(train_kwargs, test_kwargs)
 
-    model = LeNet().to(device)
+    model = model_factory(nick)
+    model = model.to(device)
+
     parameter_count = 0
     for param in model.parameters():
         print(tuple(param.shape))
@@ -269,7 +381,7 @@ def main_train():
         test(model, device, test_loader)
         # scheduler.step()
 
-    filename = pickle_filename("lenet", batch_size, lr, moment)
+    filename = pickle_filename(nick, batch_size, lr, moment)
     print("saving gradient records to", filename)
     with open(filename, "wb") as f:
         pickle.dump(full_record, f)
@@ -281,10 +393,8 @@ def main_replay():
     # probably not worth loading to gpu, but cpu does not have float16.
     device = "cuda"
 
-    if nick == "lenet":
-        model = LeNet().to(device)
-    elif nick == "record": # name for hysterical raisins.
-        model = Net().to(device)
+    model = model_factory(nick)
+    model = model.to(device)
 
     with open(filename, "rb") as f:
         full_record = pickle.load(f)
@@ -297,6 +407,11 @@ def main_replay():
         print(torch.numel(param))
     exit()
     '''
+
+    grad_tables = merge_grads(full_grad_save)
+    # meta_net = MetaLeNet(initial_state_dict, grad_tables)
+    # print(meta_net.state_dict().keys())
+
 
     if do_shuffling:
         print("randomly shuffling gradients across minibatches before replay")
