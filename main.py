@@ -85,32 +85,40 @@ class MLP(nn.Module):
 class MetaHomogeneousLinear(nn.Module):
     def __init__(self, initial_state, gradients, coeffs):
         super(MetaHomogeneousLinear, self).__init__()
+        print(initial_state.shape, gradients.shape, coeffs.shape)
         self.initial_state = initial_state
-        self.gradients = gradients
-        self.coeffs = coeffs
+        self.gradients = torch.Tensor(gradients).half().to("cuda")
+        self.coeffs = coeffs.to("cuda")
+        print(self.coeffs.dtype, self.gradients.dtype, self.initial_state.dtype)
+        print(self.coeffs.device, self.gradients.device, self.initial_state.device)
+
+        weights = self.initial_state + torch.einsum('i,ijk->jk', self.coeffs, self.gradients)
 
     def forward(self, x):
-        weights = self.initial_state + self.coeffs @ self.gradients
-        return F.linear(x, weights, 0)
+        # print("self.initial_state", self.initial_state.shape, "self.coeffs", self.coeffs.shape, "self.gradients", self.gradients.shape)
+        weights = self.initial_state + torch.einsum('i,ijk->jk', self.coeffs, self.gradients)
+        print("weights", weights.shape, "x", x.shape)
+        return torch.einsum('oi,bi->bo', weights, x)
 
 
 class MetaBias(nn.Module):
     def __init__(self, initial_state, gradients, coeffs):
         super(MetaBias, self).__init__()
         self.initial_state = initial_state
-        self.gradients = gradients
-        self.coeffs = coeffs
+        self.gradients = torch.Tensor(gradients).half().to("cuda")
+        self.coeffs = coeffs.to("cuda")
 
     def forward(self, x):
-        weights = self.initial_state + self.coeffs @ self.gradients
-        return x + weights
+        weights = self.initial_state + torch.einsum('i,ik->k', self.coeffs, self.gradients)
+        print("x", x.shape, "weights", weights.shape)
+        return x + weights.unsqueeze(0)
 
 
 class MetaLinear(nn.Module):
     def __init__(self, W_initial_state, W_gradients, b_initial_state, b_gradients, coeffs):
         super(MetaLinear, self).__init__()
-        self.metaHomogeneousLinear = MetaHomogeneousLinear(W_initial_state, W_gradients, coeffs)
-        self.metaBias = MetaBias(b_initial_state, b_gradients, coeffs)
+        self.metaHomogeneousLinear = MetaHomogeneousLinear(W_initial_state, W_gradients, coeffs).to("cuda")
+        self.metaBias = MetaBias(b_initial_state, b_gradients, coeffs).to("cuda")
 
     def forward(self, x):
         x = self.metaHomogeneousLinear(x)
@@ -118,17 +126,17 @@ class MetaLinear(nn.Module):
         return x
 
 
-class MetaMLP():
+class MetaMLP(nn.Module):
     def __init__(self, initial_state_dict, grad_tables):
-        super(MetaLeNet, self).__init__()
+        super(MetaMLP, self).__init__()
         n = grad_tables[0].shape[0]
         print(f"constructing meta network from {n} gradient steps")
-        self.meta_layer = torch.ones(n, requires_grad=True)
-        self.fc1   = MetaLinear(initial_state[0], grad_tables[0], initial_state[1], grad_tables[1], self.meta_layer)
-        self.fc2   = MetaLinear(initial_state[2], grad_tables[2], initial_state[3], grad_tables[3], self.meta_layer)
+        self.meta_layer = nn.Parameter(torch.ones(n, requires_grad=True).half())
+        self.fc1   = MetaLinear(initial_state_dict['fc1.weight'], grad_tables[0], initial_state_dict['fc1.bias'], grad_tables[1], self.meta_layer)
+        self.fc2   = MetaLinear(initial_state_dict['fc2.weight'], grad_tables[2], initial_state_dict['fc2.bias'], grad_tables[3], self.meta_layer)
 
     def forward(self, x):
-        x = torch.flatten(x)
+        x = torch.flatten(x, 1)
         x = self.fc1(x)
         x = F.relu(x)
         x = self.fc2(x)
@@ -330,7 +338,9 @@ lr = 0.08 ; moment = 0.0
 nick = "mlp"
 
 # task = "train"
-task = "replay"
+# task = "replay"
+task = "meta-learn"
+
 do_shuffling = False
 
 device = "cuda"
@@ -424,10 +434,51 @@ def main_replay():
     replay(model, test_loader, initial_state_dict, final_state_dict, full_grad_save, lr, moment)
 
 
+def main_metalearn():
+    filename = pickle_filename(nick, batch_size, lr, moment)
+
+    # probably not worth loading to gpu, but cpu does not have float16.
+    device = "cuda"
+
+    with open(filename, "rb") as f:
+        full_record = pickle.load(f)
+    (initial_state_dict, final_state_dict, full_grad_save) = full_record
+    print("full gradient record read from pickle", filename)
+
+    grad_tables = merge_grads(full_grad_save)
+
+    assert nick == "mlp", "the others are not done yet"
+    model = MetaMLP(initial_state_dict, grad_tables)
+    model = model.to(device)
+
+    train_kwargs = test_kwargs = {'batch_size': batch_size}
+    train_loader, test_loader = create_loaders(train_kwargs, test_kwargs)
+
+    meta_lr = 0.1
+    meta_moment = 0.0
+    optimizer = optim.SGD(model.parameters(), lr=meta_lr, momentum=meta_moment)
+
+    model.half()
+    model.train()
+    for batch_idx, (data, target) in enumerate(train_loader):
+        data, target = data.to(device).half(), target.to(device)
+        optimizer.zero_grad()
+        output = model(data)
+        loss = F.nll_loss(output, target)
+        loss.backward()
+        optimizer.step()
+        if batch_idx % 50 == 0:
+            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
+                1, batch_idx * len(data), len(train_loader.dataset),
+                100. * batch_idx / len(train_loader), loss.item()))
+
+
 if __name__ == '__main__':
     if task == "train":
         main_train()
     elif task == "replay":
         main_replay()
+    elif task == "meta-learn":
+        main_metalearn()
     else:
         assert False, f"unknown task {task}"
